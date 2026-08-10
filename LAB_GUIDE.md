@@ -1,0 +1,903 @@
+# Hướng Dẫn Lab — K4 Ngày 12: Hạ Tầng Cloud & Deployment
+
+> **Bài làm cá nhân.** Xem quy định và cách đặt tên repo ở [README.md](README.md).
+>
+> Mỗi block kết thúc bằng một checkpoint. Đến giờ thì chạy lệnh checkpoint,
+> xanh hết mới sang block sau. Kẹt quá 10 phút → gọi Lab Coach và đi tiếp,
+> đừng đứng lại một chỗ.
+
+**Mục lục**
+
+- [CP0 — Setup (14h00–14h20)](#cp0--setup-14h0014h20)
+- [Block 1 — 12-Factor Config, Health & Logging (14h20–15h00)](#block-1--12-factor-config-health--logging-14h2015h00)
+- [Block 2 — Docker (15h00–15h45)](#block-2--docker-15h0015h45)
+- [Block 3 — API Security (15h55–16h40)](#block-3--api-security-15h5516h40)
+- [Block 4 — Scaling & Reliability (16h40–17h20)](#block-4--scaling--reliability-16h4017h20)
+- [Block 5 — Cloud Deployment (17h20–17h50)](#block-5--cloud-deployment-17h2017h50)
+- [Bonus — CI/CD với GitHub Actions (+10 điểm)](#bonus--cicd-với-github-actions-10-điểm)
+- [Wrap-up (17h50–18h00)](#wrap-up-17h5018h00)
+- [Phụ lục A — Lỗi thường gặp](#phụ-lục-a--lỗi-thường-gặp)
+- [Phụ lục B — Bảng tra nhanh](#phụ-lục-b--bảng-tra-nhanh)
+
+---
+
+## CP0 — Setup (14h00–14h20)
+
+### 1. Tạo repo đúng tên
+
+Xem [README.md § Cách Đặt Tên Repository](README.md#-cách-đặt-tên-repository).
+Làm bước này **trước tiên** — đổi tên repo giữa chừng dễ mất commit.
+
+### 2. Môi trường
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+cp .env.example .env
+```
+
+Sinh token riêng và dán vào `API_TOKEN` trong `.env`:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+### 3. Bật Redis
+
+```bash
+docker compose up -d redis
+docker compose ps                  # cột STATE phải là running/healthy
+```
+
+Chưa có Docker? Đặt `REDIS_URL=fake://` trong `.env` để làm tạm, nhưng nhớ cài
+Docker trước Block 2.
+
+### ✅ Checkpoint 0
+
+```bash
+pytest tests/ -v -m "not docker"
+```
+
+**Kết quả mong đợi: hầu hết test RỚT.** Đó là đúng — bạn chưa viết code nào.
+Điều cần xác nhận là pytest *chạy được* và bạn *đọc được* thông báo lỗi. Nếu
+thấy `ModuleNotFoundError` hoặc `ImportError`, môi trường chưa cài xong.
+
+---
+
+## Block 1 — 12-Factor Config, Health & Logging (14h20–15h00)
+
+### Vấn đề
+
+Ba dòng code sau trông vô hại trên laptop và là thảm họa trên production:
+
+```python
+API_TOKEN = "sk-proj-abc123"        # ai clone repo cũng có token của bạn
+app.run(port=8000, debug=True)      # cloud gán cổng khác; debug=True lộ source
+print(f"client {cid} gửi {message}") # log không lọc được, không cảnh báo được
+```
+
+**12-Factor App** trả lời bằng một nguyên tắc: *code là thứ giống nhau ở mọi
+môi trường, config là thứ khác nhau — nên config phải nằm ngoài code.*
+Cùng một image chạy ở laptop, staging và production, chỉ khác biến môi trường.
+
+### Việc cần làm
+
+#### 1.1 — `app/config.py`
+
+Khai báo 7 trường trong class `Settings`. Bảng đầy đủ nằm trong docstring của
+file. Điểm quan trọng nhất: **`api_token` không có giá trị mặc định.**
+
+```python
+port: int = 8000              # có mặc định — không phải secret
+api_token: str                # KHÔNG mặc định — thiếu là app chết ngay
+```
+
+Vì sao? Mặc định nghĩa là app vẫn khởi động khi bạn quên set secret trên cloud.
+Nó chạy, trả lời request, và bạn chỉ biết có chuyện khi nhìn hóa đơn. Không
+mặc định = lỗi hiện ra lúc deploy, khi bạn còn đang nhìn màn hình.
+
+pydantic-settings tự ánh xạ tên trường sang biến môi trường viết hoa:
+`api_token` ← `API_TOKEN`.
+
+#### 1.2 — `app/logging_utils.py`
+
+Cài `emit()` sao cho mỗi lần gọi in ra **một dòng JSON**:
+
+```json
+{"event": "chat_completed", "severity": "INFO", "ts": "2026-08-01T14:30:00+00:00", "client_id": "sv01", "usd_cost": 0.0001}
+```
+
+Một dòng — không `indent`. Cloud gom log theo dòng; JSON xuống dòng là một log
+bị vỡ thành nhiều mảnh vô nghĩa.
+
+Tên khóa `severity` viết hoa không phải ngẫu nhiên: đó là khóa Google Cloud
+Logging đọc để lọc theo mức độ. Log platform nào cũng có một quy ước
+tương tự — dùng đúng quy ước thì được cả hệ sinh thái công cụ hỗ trợ miễn phí.
+
+Có định dạng này rồi thì bạn hỏi được những câu mà `print()` không trả lời nổi:
+*"client nào tiêu nhiều tiền nhất hôm nay?"*, *"tỷ lệ lỗi 5 phút qua là bao nhiêu?"*
+
+#### 1.3 — `/healthz` trong `app/main.py`
+
+```
+GET /healthz  →  200  {"status": "ok", "service": ..., "version": ...}
+```
+
+Đang tắt dần (`shutdown_guard.draining`) → `503 {"status": "draining"}`.
+Phần 503 thuộc CP4, nhưng viết luôn bây giờ cũng được.
+
+**Quy tắc: `/healthz` không được chạm vào Redis, database hay bất cứ dependency
+nào.** Nó chỉ trả lời "process này có cần restart không?". Nếu nó phụ thuộc
+Redis, Redis nấc một cái là orchestrator restart toàn bộ container — biến sự cố
+nhỏ thành sự cố lớn. (Endpoint kiểm tra dependency là `/readyz`, làm ở CP4.)
+
+Tên có đuôi `z` là quy ước từ Kubernetes: `/healthz`, `/readyz`, `/livez`. Chữ
+`z` để tránh đụng với route thật của ứng dụng.
+
+### Thử chạy
+
+```bash
+uvicorn app.main:app --reload --port 8000
+curl -i http://localhost:8000/healthz
+```
+
+### ✅ Checkpoint 1 (15h00)
+
+```bash
+pytest tests/test_cp1.py -v
+```
+
+<details>
+<summary>Kẹt? Vài gợi ý</summary>
+
+- `ValidationError` khi khởi động: `.env` thiếu `API_TOKEN`
+- Test `test_log_ra_stdout_dung_mot_dong` rớt: bạn đang dùng `json.dumps(..., indent=2)`
+- Test `test_severity_luon_viet_hoa` rớt: quên `.upper()`
+- Test `test_healthz_khong_phu_thuoc_dependency_nao` rớt: hàm `healthz()` của bạn
+  đang nhận tham số `Depends(...)` — bỏ đi
+- Tiếng Việt trong log bị thành `ạ`: thêm `ensure_ascii=False`
+
+</details>
+
+---
+
+## Block 2 — Docker (15h00–15h45)
+
+### Vấn đề
+
+"Máy tôi chạy được" — vì máy bạn có Python 3.11, máy server có 3.9; máy bạn có
+`libpq`, server không. Docker đóng gói *cả môi trường* vào một image: cùng một
+image thì chạy giống nhau ở mọi nơi.
+
+Nhưng image sai cách cũng gây họa: image 1.8GB làm deploy chậm 5 phút mỗi lần;
+container chạy root biến một lỗ hổng nhỏ thành quyền cao trên host; không có
+`.dockerignore` thì `.env` của bạn nằm luôn trong image gửi lên registry.
+
+### Việc cần làm
+
+File `Dockerfile` hiện tại chạy được nhưng vi phạm gần hết các nguyên tắc. Sửa
+lại theo 6 yêu cầu ghi trong chính file đó. **Đích: image dưới 400MB.**
+
+#### 2.1 — Multi-stage build
+
+```dockerfile
+FROM python:3.11-slim AS builder
+# ... cài dependency ở đây (có thể cần compiler)
+
+FROM python:3.11-slim AS runtime
+COPY --from=builder /install /usr/local
+# ... chỉ copy KẾT QUẢ sang, không mang theo compiler
+```
+
+Stage `builder` được phép nặng: nó cài `build-essential`, biên dịch, rồi bị vứt
+đi. Chỉ stage cuối trở thành image. Đây là cách image tụt từ ~1.8GB xuống ~300MB.
+
+#### 2.2 — Thứ tự lệnh quyết định tốc độ build
+
+```dockerfile
+COPY requirements.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+COPY app ./app                    # code copy SAU
+```
+
+Docker cache theo từng layer và huỷ cache từ layer đầu tiên thay đổi trở đi.
+Đặt `COPY . .` lên trước `pip install` nghĩa là mỗi lần sửa một dấu phẩy trong
+code, Docker cài lại toàn bộ thư viện.
+
+#### 2.3 — Không chạy bằng root
+
+```dockerfile
+RUN useradd --create-home --uid 10001 appuser
+USER appuser
+```
+
+#### 2.4 — HEALTHCHECK và PORT
+
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz').read()" || exit 1
+
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+```
+
+`0.0.0.0` chứ không phải `127.0.0.1`: bind vào localhost thì bên ngoài container
+không gọi vào được. `${PORT:-8000}` vì Railway/Render/Cloud Run tự gán cổng.
+
+#### 2.5 — `.dockerignore`
+
+Bổ sung tối thiểu: `.env`, `__pycache__`, `.git`, `.venv`. Nhớ giữ lại những
+thứ image **cần** (`app`, `utils`, `requirements.txt`) — ignore nhầm thì build
+xong app không chạy.
+
+#### 2.6 — `docker-compose.yml`
+
+Thêm service `chat`: build từ Dockerfile, mở cổng 8000, `depends_on: redis`,
+có healthcheck, và:
+
+```yaml
+environment:
+  API_TOKEN: ${API_TOKEN}              # đọc từ .env, KHÔNG viết thẳng token
+  REDIS_URL: redis://redis:6379/0      # `redis` là tên service = hostname
+```
+
+`localhost` bên trong container là chính container đó, không phải máy bạn —
+đây là lỗi phổ biến nhất khi mới dùng compose.
+
+### Thử chạy
+
+```bash
+docker build -t day12-chat:prod .
+docker images day12-chat:prod           # ghi lại dung lượng cho câu 3 exercises
+
+docker compose up -d
+curl http://localhost:8000/healthz
+docker compose logs chat
+```
+
+### ✅ Checkpoint 2 (15h45)
+
+```bash
+pytest tests/test_cp2.py -v
+```
+
+Các test build image thật mất vài phút. Muốn kiểm tra nhanh phần cấu trúc:
+
+```bash
+pytest tests/test_cp2.py -v -m "not docker"
+```
+
+<details>
+<summary>Kẹt? Vài gợi ý</summary>
+
+- `failed to compute checksum ... not found`: bạn `COPY` một thư mục đang bị
+  `.dockerignore` loại trừ
+- Image vẫn hơn 400MB: kiểm tra stage runtime có phải `slim` không, và bạn có
+  thật sự `COPY --from=builder` thay vì cài lại dependency ở stage cuối
+- Container start rồi tắt ngay: `docker compose logs chat` — thường là thiếu
+  biến môi trường nên `Settings` ném `ValidationError`
+- `Connection refused` khi curl: uvicorn đang bind `127.0.0.1`, đổi sang `0.0.0.0`
+
+</details>
+
+---
+
+## Block 3 — API Security (15h55–16h40)
+
+### Vấn đề
+
+Bạn vừa có một URL công khai. Nó cũng công khai với các bot quét Internet —
+chúng tìm thấy endpoint mới trong vòng vài giờ. Không có lớp bảo vệ, mỗi request
+của người lạ là một lần bạn trả tiền cho nhà cung cấp LLM.
+
+Ba lớp, ba câu hỏi khác nhau:
+
+| Lớp | Câu hỏi | Mã lỗi |
+|-----|---------|--------|
+| Authentication | Bạn là ai? | 401 |
+| Token bucket | Bạn gọi có quá nhanh không? | 429 |
+| Cost guard | Bạn đã tiêu hết ngân sách hôm nay chưa? | 402 |
+
+### Việc cần làm
+
+#### 3.1 — `app/auth.py`: Bearer token
+
+Chuẩn **RFC 6750**: token đi trong header `Authorization`, kèm scheme:
+
+```
+Authorization: Bearer <token>
+```
+
+Ba việc cần làm đúng:
+
+1. **Tách scheme khỏi token**: `scheme, _, token = authorization.partition(" ")`.
+   Sai scheme hoặc token rỗng → 401. So sánh scheme không phân biệt hoa thường
+   (chuẩn quy định vậy).
+2. **So sánh token bằng `secrets.compare_digest`, không dùng `==`.** Toán tử
+   `==` dừng ngay tại ký tự đầu tiên khác nhau, nên thời gian trả lời rò rỉ
+   thông tin: đoán đúng ký tự đầu thì phản hồi chậm hơn một chút. Với đủ số lần
+   đo, kẻ tấn công dò ra token từng ký tự một. `compare_digest` luôn chạy hết chuỗi.
+3. **401 phải kèm header `WWW-Authenticate: Bearer`** — chuẩn HTTP yêu cầu
+   response 401 nói cho client biết phải xác thực kiểu gì.
+
+Dùng **cùng một** thông báo lỗi cho mọi trường hợp. "Sai scheme" và "sai token"
+là hai thông tin khác nhau, và người đang dò sẽ rất biết ơn nếu bạn phân biệt hộ.
+
+#### 3.2 — `app/rate_limiter.py`: token bucket
+
+Hình dung mỗi client có một cái xô:
+
+- Xô chứa tối đa `capacity` token, ban đầu đầy
+- Token tự nhỏ vào xô với tốc độ `refill_per_minute` mỗi phút
+- Mỗi request lấy 1 token; xô cạn → 429
+
+```
+tokens_hiện_tại = min(capacity, tokens_cũ + (now - ts_cũ) × refill_mỗi_giây)
+```
+
+Vì sao không đơn giản là "tối đa N request mỗi phút"? Vì người dùng thật không
+gửi request đều tăm tắp — họ im lặng 5 phút rồi bấm 8 lần liên tiếp. Token
+bucket cho phép đúng kiểu dùng đó (im lặng thì tích token, cần thì tiêu một
+lúc) mà vẫn chặn được kẻ gọi liên tục không nghỉ. Đây là lý do nó là thuật toán
+mặc định ở hầu hết API gateway.
+
+Hai chi tiết dễ sai:
+- **Chặn trên ở `capacity`.** Thiếu `min(...)` thì client im lặng một ngày sẽ
+  tích được 14.400 token và bắn hết trong một giây.
+- **Ghi lại cả `ts`.** Quên cập nhật mốc thời gian thì lần sau bạn tính phần
+  nạp thêm từ một mốc đã cũ, và xô tự đầy lại vô tội vạ.
+
+#### 3.3 — `app/cost_guard.py`: ngân sách theo ngày
+
+`spent()` đọc tổng chi tiêu trong ngày, `check()` chặn khi vượt, `record()` cộng
+dồn. Key theo `spend:<client>:<YYYY-MM-DD>` nên sang ngày mới là tự reset.
+
+Vì sao theo ngày mà không theo tháng? Hạn mức tháng chỉ báo động sau khi bạn đã
+mất phần lớn số tiền. Hạn mức ngày giới hạn thiệt hại tối đa của một sự cố
+xuống 1/30, và sáng hôm sau service tự hồi phục mà không cần ai can thiệp.
+
+Rate limit và cost guard **không thay thế nhau**: 10 request/phút nghe có vẻ an
+toàn, nhưng mỗi request 50.000 token thì ngân sách bay trong vài phút.
+
+#### 3.4 — `/chat` trong `app/main.py`
+
+Ghép lại, đúng thứ tự:
+
+```
+verify_bearer_token (dependency)  →  bucket.consume  →  guard.check
+    →  store.history  →  generate_reply  →  add_turn × 2  →  guard.record  →  emit
+```
+
+Chặn **trước** khi gọi LLM. Chặn sau thì bạn vừa mất tiền vừa trả lỗi cho user.
+
+### Thử chạy
+
+```bash
+# Không token → 401
+curl -i -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" -d '{"message":"Hello"}'
+
+# Có token → 200
+curl -i -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $API_TOKEN" -H "X-Client-Id: sv01" \
+  -d '{"message":"Docker là gì?"}'
+
+# Gọi 15 lần → những lần cuối phải 429
+for i in $(seq 1 15); do
+  curl -s -o /dev/null -w "%{http_code} " -X POST http://localhost:8000/chat \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $API_TOKEN" -H "X-Client-Id: sv01" \
+    -d '{"message":"test"}'
+done; echo
+```
+
+### ✅ Checkpoint 3 (16h40)
+
+```bash
+pytest tests/test_cp3.py -v
+```
+
+<details>
+<summary>Kẹt? Vài gợi ý</summary>
+
+- `test_khong_nap_qua_suc_chua` rớt: thiếu `min(float(self.capacity), tokens)`
+- `test_token_nap_lai_theo_thoi_gian` rớt: quên ghi lại `ts` trong `hset`, hoặc
+  dùng `time.time()` thay vì tham số `now`
+- `test_sai_scheme_thi_401` rớt: bạn đang so sánh cả chuỗi `authorization` với
+  token thay vì tách scheme ra trước
+- `spent()` ném `TypeError`: Redis trả `None` khi chưa có key — trả `0.0`
+- `/chat` trả 500: chạy `pytest tests/test_cp3.py -x --tb=short` để thấy dòng lỗi
+
+</details>
+
+---
+
+## Block 4 — Scaling & Reliability (16h40–17h20)
+
+### Vấn đề
+
+Một instance không đủ, và instance nào cũng có thể chết bất cứ lúc nào — cloud
+restart container để vá lỗi, dời máy, hoặc vì bạn deploy bản mới. Hệ thống phải
+chịu được điều đó mà user không nhận ra.
+
+### Việc cần làm
+
+#### 4.1 — `app/store.py`: state ra khỏi process
+
+```python
+#  Sai — mỗi container một dict riêng
+chat_history = {}
+
+#  Đúng — mọi container cùng nhìn một Redis
+self.client.rpush(f"chat:{client_id}", ...)
+```
+
+Với 3 instance sau load balancer, tin nhắn 1 của client vào container A, tin
+nhắn 2 vào container B. Nếu lịch sử nằm trong RAM của A thì B không biết gì —
+service "mất trí nhớ" ngẫu nhiên. Đó là lý do stateless không phải tùy chọn.
+
+Hai chi tiết bắt buộc:
+- `ltrim` giữ tối đa `HISTORY_MAX_MESSAGES` message gần nhất — prompt dài vô hạn
+  = tiền token vô hạn
+- `expire` để hội thoại cũ tự hết hạn — không thì Redis đầy dần đến khi sập
+
+`ping()` phải nuốt mọi exception và trả `False`. Nó dùng cho `/readyz`; một
+exception thoát ra sẽ biến readiness probe thành lỗi 500.
+
+#### 4.2 — `/readyz`
+
+```
+Redis sống  →  200 {"status": "ready", "redis": true}
+Redis chết  →  503 {"status": "not ready", "redis": false}
+Đang tắt    →  503 {"status": "draining"}
+```
+
+Khác `/healthz` ở đúng một điểm cốt lõi:
+
+| | `/healthz` (liveness) | `/readyz` (readiness) |
+|---|---|---|
+| Câu hỏi | Process còn sống không? | Nhận traffic được chưa? |
+| Kiểm tra dependency | **Không** | **Có** |
+| Trả 503 thì sao | Orchestrator **restart** container | LB **ngừng gửi** request, không restart |
+
+Gộp hai cái làm một là lỗi kinh điển: Redis mất kết nối 30 giây → cả 3 container
+đều báo unhealthy → orchestrator restart cả 3 cùng lúc → khi Redis quay lại thì
+không còn container nào phục vụ. Sự cố nhỏ thành sự cố toàn hệ thống.
+
+#### 4.3 — `app/lifecycle.py`: draining
+
+Khi bạn deploy bản mới, platform gửi **SIGTERM** rồi đợi (thường 10–30 giây)
+trước khi SIGKILL. App bỏ qua SIGTERM = mọi request đang xử lý dở bị cắt giữa
+chừng = user thấy 502 mỗi lần bạn deploy.
+
+```python
+def arm(self):
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        self._previous[sig] = signal.getsignal(sig)   # nhớ handler cũ
+        signal.signal(sig, self.start_draining)       # rồi mới ghi đè
+
+def start_draining(self, signum=None, frame=None):
+    self.draining = True                              # chỉ bật cờ
+    previous = self._previous.get(signum)
+    if callable(previous):
+        previous(signum, frame)                       # nhường lại cho uvicorn
+```
+
+Handler chạy xen giữa bytecode nên chỉ được làm việc rất nhẹ. Bật cờ →
+`/healthz` trả 503 → load balancer rút instance khỏi vòng xoay → uvicorn xử lý
+nốt request đang chạy rồi thoát.
+
+**Cái bẫy ở đây:** mỗi tín hiệu chỉ có **một** handler. Đăng ký handler của mình
+là ghi đè handler của uvicorn — thứ chịu trách nhiệm thật sự cho việc dừng
+server. Quên gọi lại nó thì app bật cờ "đang tắt" rồi chạy tiếp mãi mãi, cho tới
+khi orchestrator hết kiên nhẫn và SIGKILL. Bạn viết code graceful shutdown để
+rồi bị kill cứng — tệ hơn là không viết gì.
+
+### Thử chạy
+
+```bash
+docker compose up -d --scale chat=3
+docker compose ps                      # 3 container chat
+
+# Gọi nhiều lần với cùng client — turns_before phải TĂNG DẦN dù đổi container
+for i in $(seq 1 5); do
+  curl -s -X POST http://localhost:8000/chat \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $API_TOKEN" -H "X-Client-Id: sv01" \
+    -d '{"message":"lượt '$i'"}' | python -c "import json,sys; print(json.load(sys.stdin)['turns_before'])"
+done
+```
+
+Muốn xem load balancing thật thì bật thêm service `nginx` (cấu hình đã có sẵn ở
+`nginx/nginx.conf`) và gọi qua cổng 80 — phần điểm cộng.
+
+### ✅ Checkpoint 4 (17h20)
+
+```bash
+pytest tests/test_cp4.py -v
+```
+
+<details>
+<summary>Kẹt? Vài gợi ý</summary>
+
+- `test_cat_bot_lich_su_qua_dai` rớt: `ltrim(key, -N, -1)` giữ N phần tử **cuối**
+  (mới nhất). `ltrim(key, 0, N-1)` giữ nhầm phần cũ nhất.
+- `test_dang_ky_handler...` rớt: bạn truyền `self.start_draining()` (đã gọi)
+  thay vì `self.start_draining` (tham chiếu hàm)
+- `test_khong_co_bien_toan_cuc_giu_state` rớt: còn một dict toàn cục trong
+  `main.py` hoặc `store.py` — xóa và chuyển sang Redis
+- `/readyz` trả 200 dù Redis chết: bạn quên kiểm tra giá trị trả về của `ping()`
+
+</details>
+
+---
+
+## Block 5 — Cloud Deployment (17h20–17h50)
+
+### Chọn platform
+
+| Platform | Độ khó | Free tier | Redis kèm theo |
+|----------|--------|-----------|----------------|
+| **Railway** | ⭐ | $5 credit dùng thử | Có, thêm 1 click |
+| **Render** | ⭐⭐ | 750 giờ/tháng | Có (Key Value) |
+| Cloud Run | ⭐⭐⭐ | 2 triệu request/tháng | Không — cần Memorystore/Upstash |
+
+Chọn Railway nếu bạn muốn xong nhanh. Cả hai đều đọc `Dockerfile` bạn vừa viết.
+
+### Đường Railway
+
+```bash
+npm i -g @railway/cli
+railway login
+railway init                       # đặt tên project
+railway add --database redis       # tạo Redis, tự sinh biến REDIS_URL
+
+railway variables --set API_TOKEN=<token của bạn> \
+                  --set BUCKET_CAPACITY=10 \
+                  --set REFILL_PER_MINUTE=10 \
+                  --set DAILY_BUDGET_USD=1.0 \
+                  --set LOG_LEVEL=INFO
+
+railway up                         # build từ Dockerfile và deploy
+railway domain                     # sinh URL công khai
+railway logs                       # xem log khi có sự cố
+```
+
+Kiểm tra biến `REDIS_URL` đã được gắn vào service chưa (dashboard → service →
+Variables). Railway tự set `PORT` — đừng ghi đè.
+
+### Đường Render
+
+1. Push repo lên GitHub (repo đúng tên `K4-DAY12-...`)
+2. [render.com](https://render.com) → **New** → **Blueprint** → chọn repo
+3. Render đọc `render.yaml` có sẵn, tạo cả web service lẫn Redis
+4. Điền `API_TOKEN` khi Render hỏi (khai báo `sync: false` nghĩa là Render
+   không lấy giá trị từ repo — đúng như vậy, secret không nằm trong repo)
+5. **Create** và chờ build
+
+### Kiểm tra bản deploy
+
+```bash
+URL=https://<domain-cua-ban>
+
+curl -i $URL/healthz         # 200 {"status":"ok"}
+curl -i $URL/readyz          # 200 {"status":"ready"} ← chứng minh đã nối Redis
+curl -i -X POST $URL/chat -H "Content-Type: application/json" \
+  -d '{"message":"Hello"}'   # 401 — không có token thì không được vào
+```
+
+`/readyz` trả 503 gần như luôn có nghĩa là `REDIS_URL` trên cloud sai hoặc chưa
+tạo Redis.
+
+### Điền `DEPLOYMENT.md`
+
+Mở [DEPLOYMENT.md](DEPLOYMENT.md), điền Public URL, platform, danh sách biến môi
+trường, và dán output các lệnh trên. Chụp màn hình dashboard vào `screenshots/`.
+
+**Chỉ ghi TÊN biến, không dán giá trị `API_TOKEN`.** Repo công khai, dán vào
+là mất token — và test CP5 sẽ báo lỗi đúng chỗ đó.
+
+**Điểm cộng — test luôn cả đường có xác thực.** Thêm vào `.env` ở máy bạn
+(file này không được commit):
+
+```bash
+DEPLOY_API_TOKEN=<đúng giá trị API_TOKEN bạn đã set trên dashboard>
+```
+
+`DEPLOY_API_TOKEN` là token của **chính service bạn vừa deploy**, không phải
+token của Railway hay Render. Lab này không cần token của platform ở bất cứ
+đâu — trừ phần bonus CI/CD, và khi đó nó nằm trong GitHub Secrets chứ không
+nằm trong `.env`.
+
+Nếu token trên cloud khác token bạn dùng ở máy thì điền token trên cloud —
+test gọi vào bản deploy, không gọi vào máy bạn.
+
+### Không deploy được?
+
+Đăng ký thất bại, không có thẻ, mạng chặn — vẫn nộp được bài:
+
+1. `LOCAL_FALLBACK=true` trong `.env`
+2. `docker compose up -d` và kiểm tra `docker compose ps`
+3. Chụp màn hình vào `screenshots/`
+4. Ghi lý do vào cuối `DEPLOYMENT.md`
+
+CP5 khi đó tối đa 9/15 điểm.
+
+### ✅ Checkpoint 5 (17h50)
+
+```bash
+pytest tests/test_cp5.py -v
+```
+
+<details>
+<summary>Kẹt? Vài gợi ý</summary>
+
+- Build trên cloud fail còn ở máy thì được: thường do `.dockerignore` loại trừ
+  file mà build cần, hoặc bạn quên commit file nào đó
+- Deploy xong nhưng health check timeout: app đang bind `127.0.0.1` hoặc cố định
+  cổng 8000 thay vì đọc `$PORT`; hoặc platform đang gọi `/health` thay vì `/healthz`
+- Request đầu tiên rất chậm rồi các request sau nhanh: free tier "ngủ đông" khi
+  không có traffic — bình thường
+- `/readyz` 503: kiểm tra `REDIS_URL` trong dashboard
+
+</details>
+
+---
+
+## Bonus — CI/CD với GitHub Actions (+10 điểm)
+
+> **Không bắt buộc.** Chỉ làm khi CP1–CP5 đã ổn. Có thể làm ở nhà sau buổi lab.
+>
+> Phần này lab **không cho sẵn file mẫu** — bạn tự đọc tài liệu và tự viết.
+> Kiểm tra: `pytest tests/test_bonus_cicd.py -v`
+
+### Vấn đề
+
+Đến CP5 bạn deploy bằng tay: gõ `railway up` từ máy mình. Cách đó hỏng theo ba
+kiểu, và cả ba đều xảy ra trong thực tế:
+
+1. **Deploy code chưa test.** Bạn sửa vội một dòng, quên chạy pytest, đẩy thẳng
+   lên production. Không ai chặn bạn lại.
+2. **Không ai biết trên production đang chạy gì.** Bạn deploy từ máy bạn, đồng
+   đội deploy từ máy họ, không có dấu vết nào ghi lại ai đẩy commit nào lên lúc nào.
+3. **"Máy tôi build được".** Image build ngon trên macOS của bạn, hỏng trên
+   Linux của server — vì bạn chưa bao giờ build nó ở một môi trường sạch.
+
+**CI/CD** trả lời cả ba: mỗi lần push, một máy sạch của GitHub sẽ checkout code,
+chạy test, build image, và **chỉ khi tất cả xanh** mới deploy. Mọi lần deploy
+đều gắn với một commit và một log công khai.
+
+- **CI** (Continuous Integration) — tự động kiểm tra mọi thay đổi
+- **CD** (Continuous Deployment) — tự động đưa thay đổi đã kiểm tra lên production
+
+### Cách GitHub Actions hoạt động
+
+Đặt file YAML vào `.github/workflows/`, GitHub tự đọc và chạy. Ba khái niệm:
+
+| Khái niệm | Là gì |
+|-----------|-------|
+| **workflow** | một file YAML, kích hoạt bởi một sự kiện (`on:`) |
+| **job** | một nhóm bước chạy trên một máy ảo riêng; các job mặc định chạy **song song** |
+| **step** | một lệnh (`run:`) hoặc một action dùng lại của người khác (`uses:`) |
+
+Điểm hay bị hiểu nhầm: job chạy song song, nên `deploy` sẽ chạy **cùng lúc** với
+`test` nếu bạn không nói gì. `needs:` là thứ xâu chúng lại thành dây chuyền.
+
+### Việc cần làm
+
+Tạo `.github/workflows/ci.yml` đạt các yêu cầu sau:
+
+**1. Kích hoạt đúng lúc**
+
+```yaml
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+```
+
+Chạy khi `pull_request` mới là phần giá trị nhất: lỗi bị bắt **trước khi** vào
+nhánh chính, không phải sau.
+
+**2. Job `test` — chạy checkpoint trên máy sạch**
+
+Các bước: `actions/checkout` → `actions/setup-python` → cài `requirements.txt` →
+chạy pytest.
+
+Hai điều cần cân nhắc:
+
+- **Chọn test nào chạy trong CI.** `tests/test_cp5.py` gọi vào bản deploy đang
+  sống — chạy trong CI sẽ luôn đỏ hoặc mất hàng chục giây chờ mạng. Loại nó ra
+  bằng `--ignore=tests/test_cp5.py`. Tương tự với `test_bonus_cicd.py`: nó kiểm
+  tra badge của chính workflow này, chạy ở đây là tự tham chiếu vòng tròn.
+- **Biến môi trường.** `Settings` bắt buộc có `API_TOKEN`, mà máy CI không
+  có `.env`. Truyền qua khối `env:` của step, dùng giá trị giả:
+
+  ```yaml
+  env:
+    API_TOKEN: ci-dummy
+    REDIS_URL: "fake://"
+  ```
+
+  Đây chính là lợi ích của 12-Factor bạn làm ở CP1: cùng một code, môi trường
+  khác nhau chỉ khác biến môi trường.
+
+**3. Job `build` — build Docker image trên máy sạch**
+
+`docker build` ngay trên runner. Runner của GitHub có sẵn Docker, không cần cài.
+Bước này bắt các lỗi kiểu "file này chỉ có trên máy tôi" hoặc `.dockerignore`
+loại nhầm thứ cần thiết.
+
+**4. Job `deploy` — chỉ chạy khi mọi thứ xanh**
+
+```yaml
+deploy:
+  needs: [test, build]
+  if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+```
+
+- `needs:` — deploy đợi test và build xong **và pass**. Thiếu dòng này thì code
+  hỏng vẫn lên production trong khi test đang đỏ.
+- `if:` — không có nó thì mỗi lần ai đó mở pull request là một lần deploy.
+
+**5. Secret — không bao giờ nằm trong file YAML**
+
+Lấy token deploy:
+
+- Railway: dashboard → Account Settings → Tokens
+- Render: Settings → Deploy Hook (một URL bí mật, gọi vào là deploy)
+
+Cất nó ở: repo → **Settings → Secrets and variables → Actions → New repository
+secret**. Trong workflow tham chiếu bằng `${{ secrets.RAILWAY_TOKEN }}`.
+
+GitHub tự che giá trị secret trong log. Nhưng nếu bạn dán thẳng token vào file
+YAML thì nó nằm trong lịch sử git vĩnh viễn — xóa ở commit sau **không** làm nó
+biến mất.
+
+Giá trị không bí mật (URL public, tên service) dùng **Variables** thay vì
+Secrets: `${{ vars.PUBLIC_URL }}`.
+
+**6. Ghim phiên bản action**
+
+`actions/checkout@v4`, không phải `actions/checkout@main`. Dùng `@main` nghĩa là
+mỗi lần chạy, bạn thực thi phiên bản mới nhất của code người khác — họ đổi gì
+hôm nay bạn chịu nấy. Đây là con đường của các vụ tấn công chuỗi cung ứng.
+
+**7. Smoke test sau deploy**
+
+Deploy xong mà không kiểm tra thì bạn chỉ biết "lệnh deploy chạy xong", không
+biết "service còn sống". Thêm một bước gọi vào bản vừa lên:
+
+```yaml
+- name: Smoke test
+  run: |
+    sleep 45
+    curl -fsS "${{ vars.PUBLIC_URL }}/healthz"
+```
+
+`curl -f` trả mã lỗi khi HTTP không phải 2xx → job đỏ → bạn biết ngay.
+
+**8. Badge trên README**
+
+Thêm vào đầu `README.md`:
+
+```markdown
+![CI](https://github.com/<username>/<tên-repo>/actions/workflows/ci.yml/badge.svg)
+```
+
+Badge cho người mở repo biết ngay nhánh main đang xanh hay đỏ. Test cuối cùng
+của phần bonus **tải badge này về và kiểm tra nó đang báo `passing`** — nghĩa là
+không viết workflow cho đẹp là đủ, nó phải chạy được thật.
+
+### Thử chạy
+
+```bash
+git add .github/workflows/ci.yml README.md
+git commit -m "Thêm CI/CD với GitHub Actions"
+git push
+```
+
+Mở tab **Actions** trên GitHub, xem workflow chạy từng bước. Đỏ thì bấm vào job
+để đọc log — log của Actions rất chi tiết, thường chỉ thẳng ra dòng lệnh nào hỏng.
+
+### ✅ Checkpoint Bonus
+
+```bash
+pytest tests/test_bonus_cicd.py -v
+```
+
+<details>
+<summary>Kẹt? Vài gợi ý</summary>
+
+- `workflow chưa khai báo on:` mà bạn thấy rõ có `on:` — YAML hiểu `on` là giá
+  trị boolean `true`. Bộ test đã xử lý trường hợp này; nếu vẫn rớt thì kiểm tra
+  thụt lề của khối `on:`.
+- Job test đỏ với `ValidationError: agent_api_key Field required` — chưa truyền
+  `API_TOKEN` qua khối `env:`
+- Job test chạy rất lâu rồi timeout — bạn đang chạy cả `test_cp5.py`
+- `test_badge_bao_passing` rớt với HTTP 404 — repo đang private, hoặc tên file
+  workflow trong URL badge không khớp tên file thật
+- Deploy chạy nhưng service không đổi — kiểm tra token có đúng project không,
+  và `railway up` có đang ở đúng service không
+
+</details>
+
+---
+
+## Wrap-up (17h50–18h00)
+
+```bash
+# 1. Trả lời 10 câu trong exercises.md
+
+# 2. Chấm thử
+python grade.py
+
+# 3. Kiểm tra .env không bị commit
+git ls-files | grep "^\.env$" && echo "NGUY HIỂM: .env đang bị theo dõi!"
+
+# 4. Nộp
+git add -A
+git commit -m "Hoàn thành lab Day 12"
+git push
+```
+
+Nộp **link repository** lên LMS. Đối chiếu lại [danh sách kiểm tra](README.md#danh-sách-kiểm-tra-trước-khi-nộp).
+
+---
+
+## Phụ Lục A — Lỗi Thường Gặp
+
+| Triệu chứng | Nguyên nhân thường gặp | Cách xử lý |
+|-------------|------------------------|------------|
+| `ValidationError: api_token Field required` | chưa có `.env` hoặc thiếu biến | `cp .env.example .env` rồi điền token |
+| `ConnectionError: Error 61 connecting to localhost:6379` | Redis chưa chạy | `docker compose up -d redis` hoặc `REDIS_URL=fake://` |
+| `ModuleNotFoundError: No module named 'app'` | chạy pytest từ thư mục con | chạy từ gốc repo |
+| `curl: (7) Failed to connect` | uvicorn bind `127.0.0.1` trong container | đổi sang `--host 0.0.0.0` |
+| Container start rồi tắt ngay | thiếu biến môi trường | `docker compose logs chat` |
+| `docker build` không dùng cache | `COPY . .` đứng trước `pip install` | đảo thứ tự |
+| Image > 400MB | build 1 stage, hoặc base image không slim | multi-stage + `python:3.11-slim` |
+| 429 ngay từ request đầu | xô khởi tạo rỗng thay vì đầy | client mới → trả `float(capacity)` |
+| Xô không bao giờ cạn | quên cập nhật `ts` khi `hset` | ghi cả `tokens` và `ts` |
+| `/readyz` luôn 200 dù Redis chết | không dùng kết quả `ping()` | `if not store.ping(): return 503` |
+| Deploy xong health check fail | app không đọc `$PORT` | `--port ${PORT:-8000}` |
+
+## Phụ Lục B — Bảng Tra Nhanh
+
+**pytest**
+```bash
+pytest tests/test_cp3.py -v            # một checkpoint
+pytest tests/ -v -m "not docker"       # bỏ qua test build (nhanh hơn nhiều)
+pytest tests/test_cp3.py -x --tb=short # dừng ở lỗi đầu tiên, xem traceback gọn
+pytest tests/test_cp3.py -k bucket     # chỉ chạy test có "bucket" trong tên
+```
+
+**Docker**
+```bash
+docker build -t day12-chat:prod .
+docker images day12-chat:prod                  # xem dung lượng
+docker compose up -d --scale chat=3
+docker compose logs -f chat
+docker compose exec chat sh                    # vào trong container
+docker compose down -v                         # dọn sạch, xóa cả volume
+```
+
+**Redis**
+```bash
+docker compose exec redis redis-cli KEYS '*'
+docker compose exec redis redis-cli LRANGE chat:sv01 0 -1
+docker compose exec redis redis-cli GET spend:sv01:2026-08-01
+docker compose exec redis redis-cli HGETALL bucket:sv01
+```
+
+**Mã trạng thái HTTP dùng trong lab**
+
+| Mã | Ý nghĩa | Xuất hiện khi |
+|----|---------|---------------|
+| 200 | OK | mọi thứ ổn |
+| 401 | Unauthorized | thiếu/sai Bearer token |
+| 402 | Payment Required | hết ngân sách ngày |
+| 422 | Unprocessable Entity | body sai định dạng (pydantic bắt) |
+| 429 | Too Many Requests | xô hết token |
+| 503 | Service Unavailable | chưa ready, hoặc đang tắt dần |

@@ -1,0 +1,33 @@
+# CP5 — Cấu hình deploy Render (dùng nếu bạn chọn Render).
+#
+# Render đọc file này khi bạn tạo Blueprint từ repo GitHub.
+# `sync: false` = Render hỏi giá trị lúc deploy, KHÔNG lưu secret vào repo.
+
+services:
+  - type: web
+    name: day12-chat
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /healthz
+    envVars:
+      - key: API_TOKEN
+        sync: false
+      - key: LOG_LEVEL
+        value: INFO
+      - key: BUCKET_CAPACITY
+        value: "10"
+      - key: REFILL_PER_MINUTE
+        value: "10"
+      - key: DAILY_BUDGET_USD
+        value: "1.0"
+      - key: REDIS_URL
+        fromService:
+          name: day12-chat-redis
+          type: redis
+          property: connectionString
+
+  - type: redis
+    name: day12-chat-redis
+    plan: free
+    ipAllowList: []
