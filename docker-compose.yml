@@ -1,0 +1,65 @@
+# ═══════════════════════════════════════════════════════════════════
+# CP2 — Stack chạy ở máy bạn: chat + redis (+ nginx nếu làm phần cộng điểm)
+#
+# Service `redis` đã cho sẵn — chạy ngay từ Block 1 để có Redis mà code:
+#     docker compose up -d redis
+#
+# NHIỆM VỤ: bổ sung service `chat`. Yêu cầu:
+#   [ ] build từ Dockerfile trong thư mục hiện tại
+#   [ ] map cổng ra ngoài (8000:8000)
+#   [ ] KHÔNG viết secret thẳng vào file này — dùng nội suy biến môi trường
+#       `${API_TOKEN}` (docker compose tự đọc từ file .env cùng thư mục)
+#   [ ] REDIS_URL trỏ tới `redis://redis:6379/0` — trong compose, tên service
+#       chính là hostname
+#   [ ] depends_on: redis
+#   [ ] healthcheck gọi /healthz
+#
+# ĐIỂM CỘNG: thêm service `nginx` làm load balancer (nginx/nginx.conf đã có sẵn)
+#     docker compose up --scale chat=3
+#
+# Kiểm tra: pytest tests/test_cp2.py -v
+# ═══════════════════════════════════════════════════════════════════
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  chat:
+    build: .
+    expose:
+      - "8000"
+    environment:
+      API_TOKEN: ${API_TOKEN}
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, urllib.request; port = os.getenv('PORT', '8000'); urllib.request.urlopen(f'http://127.0.0.1:{port}/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "8000:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - agent
+
+volumes:
+  redis-data:
+
