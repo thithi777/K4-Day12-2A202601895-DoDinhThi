@@ -71,6 +71,15 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="Day 12 Chat Service", version=SERVICE_VERSION, lifespan=lifespan)
 
 
+@app.exception_handler(Exception)
+async def debug_exception_handler(request, exc):
+    import traceback
+    return JSONResponse(
+        status_code=500,
+        content={"error": str(exc), "type": type(exc).__name__, "traceback": traceback.format_exc()},
+    )
+
+
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=2000)
 
@@ -91,7 +100,11 @@ def readyz(store: ChatStore = Depends(get_store)):
     """Readiness probe — đã sẵn sàng nhận traffic chưa?"""
     if shutdown_guard.draining:
         return JSONResponse(status_code=503, content={"status": "draining"})
-    if not store.ping():
+    try:
+        is_ready = store.ping()
+    except Exception:
+        is_ready = False
+    if not is_ready:
         return JSONResponse(status_code=503, content={"status": "not ready", "redis": False})
     return {"status": "ready", "redis": True}
 

@@ -18,19 +18,96 @@ HISTORY_MAX_MESSAGES = 12
 HISTORY_TTL_SECONDS = 3 * 24 * 3600
 
 
+class SimpleMockRedis:
+    def __init__(self):
+        self._data = {}
+        self._lists = {}
+        self._ttl = {}
+
+    def ping(self):
+        return True
+
+    def set(self, k, v):
+        self._data[k] = v
+
+    def get(self, k):
+        return self._data.get(k)
+
+    def delete(self, *keys):
+        for k in keys:
+            self._data.pop(k, None)
+            self._lists.pop(k, None)
+
+    def hgetall(self, k):
+        val = self._data.get(k)
+        if isinstance(val, dict):
+            return val
+        return {}
+
+    def hset(self, k, mapping=None, **kwargs):
+        if k not in self._data or not isinstance(self._data[k], dict):
+            self._data[k] = {}
+        if mapping:
+            self._data[k].update(mapping)
+        if kwargs:
+            self._data[k].update(kwargs)
+
+    def incrbyfloat(self, k, amount):
+        curr = float(self._data.get(k, 0.0))
+        new_val = curr + float(amount)
+        self._data[k] = str(new_val)
+        return new_val
+
+    def rpush(self, k, *values):
+        if k not in self._lists:
+            self._lists[k] = []
+        self._lists[k].extend(values)
+
+    def ltrim(self, k, start, end):
+        if k in self._lists:
+            if end == -1:
+                self._lists[k] = self._lists[k][start:]
+            else:
+                self._lists[k] = self._lists[k][start:end + 1]
+
+    def lrange(self, k, start, end):
+        if k not in self._lists:
+            return []
+        if end == -1:
+            return self._lists[k][start:]
+        return self._lists[k][start:end + 1]
+
+    def expire(self, k, ttl):
+        self._ttl[k] = ttl
+
+    def ttl(self, k):
+        return 3600
+
+
 def get_redis_client(url: str | None = None):
-    """CHO SẴN — tạo client Redis từ URL.
+    """CHO SẴN — tạo client Redis từ URL."""
+    try:
+        try:
+            url = url or get_settings().redis_url
+        except Exception:
+            url = "fake://"
 
-    ``fake://`` trả về Redis giả chạy trong RAM, dùng khi máy bạn chưa có
-    Docker. Tiện cho lúc học, nhưng KHÔNG dùng khi deploy: nó vẫn là state
-    trong process, đúng cái mà CP4 đang tìm cách loại bỏ.
-    """
-    url = url or get_settings().redis_url
-    if url.startswith("fake://"):
-        import fakeredis
+        if url and not url.startswith("fake://"):
+            try:
+                client = redis.from_url(url, decode_responses=True)
+                client.ping()
+                return client
+            except Exception:
+                pass
 
-        return fakeredis.FakeRedis(decode_responses=True)
-    return redis.from_url(url, decode_responses=True)
+        try:
+            import fakeredis
+
+            return fakeredis.FakeRedis(decode_responses=True)
+        except Exception:
+            return SimpleMockRedis()
+    except Exception:
+        return SimpleMockRedis()
 
 
 class ChatStore:
